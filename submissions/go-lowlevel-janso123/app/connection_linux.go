@@ -6,10 +6,17 @@ import (
 )
 
 const clientTimeout = 75 * time.Second
+const bufferPoolMaxBytes = 8 << 20
 
 // Owned only by the loop. The bounded free list is shared between all sockets.
 type bufferPool struct {
-	free [][]byte
+	free      [][]byte
+	freeBytes int
+	// blocked is set by the memory guard while it is engaged: the pool then
+	// neither grows (put is a no-op) nor retains already-pooled buffers, so the
+	// heaviest userland retention in the process is released instead of being
+	// held while the kernel is short of memory. Buffers are reallocated lazily.
+	blocked bool
 	// Nil hooks preserve epoll's direct socket syscalls. The ring hook retains
 	// output until a send CQE advances offset on the loop thread.
 	write    func(*connection, []byte) (int, error)
@@ -25,11 +32,36 @@ func (p *bufferPool) take() []byte {
 	b := p.free[n-1]
 	p.free[n-1] = nil
 	p.free = p.free[:n-1]
+	p.freeBytes -= cap(b)
 	return b[:0]
 }
 func (p *bufferPool) put(b []byte) {
-	if b != nil && cap(b) <= maxInput && len(p.free) < 64 {
+	if b == nil || p.blocked {
+		return
+	}
+	if cap(b) <= maxInput && cap(b) <= bufferPoolMaxBytes-p.freeBytes {
 		p.free = append(p.free, b[:0])
+		p.freeBytes += cap(b)
+	}
+}
+
+// drop releases every pooled buffer to the GC. The pool's free list is the only
+// place the process can voluntarily give memory back on demand.
+func (p *bufferPool) drop() {
+	for i := range p.free {
+		p.free[i] = nil
+	}
+	p.free = p.free[:0]
+	p.freeBytes = 0
+}
+
+// setBlocked toggles pressure-relief mode. On engage it drops what the pool is
+// already holding; while blocked put is a no-op so it cannot grow again.
+// Releases (unblocked) restore the normal pooled behaviour exactly.
+func (p *bufferPool) setBlocked(blocked bool) {
+	p.blocked = blocked
+	if blocked {
+		p.drop()
 	}
 }
 
@@ -60,6 +92,54 @@ func (c *connection) release(p *bufferPool) {
 	c.input, c.output = nil, nil
 	c.offset = 0
 }
+
+// releaseIdle returns the buffer of a connection that holds no request state
+// (no partial request buffered, no response being built, no pending send, not
+// draining). Such a connection is idle and keeps no per-connection buffer while
+// the guard is engaged; the buffer is reallocated lazily on the next read. Only
+// truly idle connections are touched, so no in-flight data is ever dropped.
+func (c *connection) releaseIdle(p *bufferPool) {
+	if c.pending || c.draining || c.output != nil || c.offset != 0 || len(c.input) != 0 {
+		return
+	}
+	if c.input != nil {
+		p.put(c.input)
+		c.input = nil
+	}
+}
+
+// shedIdle reports whether a connection holds no in-flight work and may be
+// closed immediately by the emergency shedder: no partial request buffered, no
+// response being built, no pending send, no in-flight writer/DB job, not
+// draining. Durability: an acknowledged write is only produced once the writer
+// job completes (which clears pending), so shedIdle is never true for a
+// connection whose write has not committed; closing here can only drop work the
+// server never acknowledged.
+func (c *connection) shedIdle() bool {
+	return !c.pending && !c.draining && c.output == nil && c.offset == 0 && len(c.input) == 0
+}
+
+// shedSweepIdle closes at most budget idle connections from conns, calling
+// closer then counted for each. It never selects a connection with in-flight
+// work (see shedIdle), so a response being written or a writer job in the queue
+// is left for its own completion path. It returns the number closed. Mutating
+// the map in closer (as the epoll backend does) is safe during the range.
+func shedSweepIdle(conns map[int32]*connection, budget int, closer func(*connection), counted func()) int {
+	closed := 0
+	for _, c := range conns {
+		if closed >= budget {
+			break
+		}
+		if !c.shedIdle() {
+			continue
+		}
+		counted()
+		closer(c)
+		closed++
+	}
+	return closed
+}
+
 func (c *connection) flush(p *bufferPool) (bool, error) {
 	for c.offset < len(c.output) {
 		var n int
@@ -110,10 +190,13 @@ func (c *connection) drive(p *bufferPool, handle func(job) reply, now time.Time)
 			c.deadline = now.Add(clientTimeout).UnixNano()
 			return false, nil
 		}
-		req, n, parseErr := parseRequest(c.input)
+		req, n, parseErr := parseRequestPooled(c.input, p)
 		if parseErr == nil && req.expect && !c.continued {
 			c.continued = true
 			c.output = append(p.take(), "HTTP/1.1 100 Continue\r\n\r\n"...)
+			if req.bodyPooled {
+				p.put(req.job.body)
+			}
 			continue
 		}
 		if parseErr == nil && n == 0 {
@@ -139,6 +222,9 @@ func (c *connection) drive(p *bufferPool, handle func(job) reply, now time.Time)
 		} else {
 			// status zero means a validated write was admitted; resume on commit completion.
 			r = handle(req.job)
+			if req.bodyPooled {
+				p.put(req.job.body)
+			}
 			c.closing = req.close
 			copy(c.input, c.input[n:])
 			c.input = c.input[:len(c.input)-n]

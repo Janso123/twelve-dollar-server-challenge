@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
+	"lowlevel/internal/netring"
 	"os"
 	"time"
-	"lowlevel/internal/netring"
 )
 
 const (
@@ -46,25 +46,31 @@ type uringBackend struct {
 	other        *netring.Ring
 	direct       bool
 	active       [2]int
-	accepts      [2]uint64
 	conns        map[int32]*uringConn
 	pool         bufferPool
 	generation   uint32
 	acceptLive   [2]bool
 	acceptCancel [2]bool
 	acceptRetry  [2]time.Time
+	// Memory guard: while set, multishot accepts stay cancelled and are not
+	// rearmed, so new clients wait in the kernel backlog instead of consuming
+	// ring slots and per-connection memory. Loop-thread-only.
+	memBlocked bool
 	// A fixed slot cannot be handed to a later accept until its CLOSE CQE has
 	// been consumed. Stop the multishot accept while closes are in flight.
-	closeWaiting    map[*uringConn]bool
-	waitingClose    [2]int
-	closePending    [2]int
-	dirty           map[*uringConn]bool
-	stale           uint64
-	handle          func(job) reply
-	w               *writer
-	current         *connection
-	work            []*uringConn
-	waiting         map[*uringConn]bool
+	closeWaiting map[*uringConn]bool
+	waitingClose [2]int
+	closePending [2]int
+	dirty        map[*uringConn]bool
+	stale        uint64
+	handle       func(job) reply
+	w            *writer
+	current      *connection
+	work         []*uringConn
+	waiting      map[*uringConn]bool
+	// Set only while loop runs; nil-safe cap checks keep tests and any
+	// guard-less use on the original behaviour.
+	guard *memGuard
 }
 
 func newUringBackend() (*uringBackend, error) {
@@ -276,13 +282,21 @@ func (b *uringBackend) drive(s *uringConn, now time.Time) {
 			continue
 		}
 		if len(c.input) > 0 {
-			_, n, e := parseRequest(c.input)
+			_, n, e := parseRequestCheck(c.input)
 			if n > 0 || e != nil {
 				b.dirty[s] = true
 				return
 			}
 		}
 		if s.eof {
+			b.closeConn(s)
+			return
+		}
+		// Emergency shedding: instead of re-arming recv, close a connection
+		// whose in-flight response has been fully sent (no live send, no held
+		// receive buffer, no writer job, no buffered output or partial request).
+		if b.guard != nil && b.guard.shedding() && s.shedIdle() {
+			b.guard.noteShedClose(false)
 			b.closeConn(s)
 			return
 		}
@@ -387,11 +401,29 @@ func (b *uringBackend) completeOn(ringIndex int, v netring.Completion, now time.
 		if b.direct {
 			fd |= ringIndex << 28
 			b.active[ringIndex]++
-			b.accepts[ringIndex]++
 		}
 		c := &connection{fd: int32(fd), generation: b.generation, deadline: now.Add(clientTimeout).UnixNano()}
 		s := &uringConn{c: c, r: b.ring(ringIndex), ringIndex: ringIndex}
 		b.conns[c.fd] = s
+		// Admission checks count the connections preceding this accepted socket.
+		if b.guard != nil && (b.guard.acceptBlocked(len(b.conns)-1, now) || b.guard.overCap(len(b.conns))) {
+			// Accept that was already in flight when the guard engaged (memory
+			// watermark) or when the hard cap was observed. Close it without
+			// arming any recv and pause the multishot accept; a late accept must
+			// not allocate recv buffers while the guard is blocking.
+			b.pauseAccept(ringIndex)
+			b.closeConn(s)
+			return nil
+		}
+		if b.guard != nil && !b.guard.admit(now) {
+			// Gradual re-admission: the token bucket for this window is empty.
+			// Close this already-completed accept without arming a recv and
+			// pause the multishot accept; the loop re-arms it once tokens
+			// refill. Excess clients stay in the kernel backlog.
+			b.pauseAccept(ringIndex)
+			b.closeConn(s)
+			return nil
+		}
 		b.arm(s)
 		if b.direct && b.active[ringIndex] >= b.ring(ringIndex).DirectSlots() {
 			b.pauseAccept(ringIndex)
@@ -500,9 +532,63 @@ func (b *uringBackend) pauseAccept(i int) {
 		b.acceptCancel[i] = true
 	}
 }
-func (b *uringBackend) loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error) (err error) {
+
+// shedIdle is the io_uring analogue of connection.shedIdle: no live send, no
+// held receive buffer, no partial request, no pending writer job.
+func (s *uringConn) shedIdle() bool {
+	return !s.closing && !s.sendLive && len(s.pending) == 0 && s.c.shedIdle()
+}
+
+// applyGuard evaluates the memory guard and applies the accept gate. It runs at
+// the top of every loop iteration and between bounded chunks of completion
+// processing, so a watermark crossed by a burst of completions takes effect
+// without waiting for the whole batch. On engage the multishot accepts are
+// paused, the process pool is dropped and idle connections release their input
+// buffers; while shedding it also closes idle connections in bounded batches.
+func (b *uringBackend) applyGuard(now time.Time) {
+	if b.guard == nil {
+		return
+	}
+	if blocked := b.guard.update(len(b.conns), now); blocked != b.memBlocked {
+		b.memBlocked = blocked
+		b.pool.setBlocked(blocked)
+		if blocked {
+			b.pauseAccept(0)
+			if b.direct {
+				b.pauseAccept(1)
+			}
+			for _, s := range b.conns {
+				s.c.releaseIdle(&b.pool)
+			}
+		}
+	}
+	if b.guard.shedSweepDue(now) {
+		b.shedSweep()
+	}
+}
+
+// shedSweep closes up to memGuardShedBatch idle connections. Active
+// connections (a send in flight, a writer job queued, buffered output, a held
+// receive buffer or a partial request) are left to their own completion path,
+// which closes them right after the in-flight response is fully sent.
+func (b *uringBackend) shedSweep() {
+	budget := memGuardShedBatch
+	for _, s := range b.conns {
+		if budget == 0 {
+			return
+		}
+		if !s.shedIdle() {
+			continue
+		}
+		b.guard.noteShedClose(true)
+		b.closeConn(s)
+		budget--
+	}
+}
+func (b *uringBackend) loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error, g *memGuard) (err error) {
 	b.handle = a.handle
 	b.w = w
+	b.guard = g
 	a.submit = func(q writeRequest) reply {
 		q.fd = b.current.fd
 		q.generation = b.current.generation
@@ -532,9 +618,16 @@ func (b *uringBackend) loop(listener int, a *app, w *writer, stop <-chan os.Sign
 			return 0, e
 		}
 		now := time.Now()
-		for _, v := range events {
+		for k, v := range events {
 			if e = b.completeOn(i, v, now); e != nil {
 				return 0, e
+			}
+			// Re-evaluate the guard between bounded chunks of completions so a
+			// watermark crossed by a burst of accepts/closes (or a shed
+			// threshold) takes effect without waiting for the whole batch. The
+			// nominal reaction is 100-200 ms; this is not a hard bound.
+			if (k+1)%256 == 0 {
+				b.applyGuard(time.Now())
 			}
 		}
 		return len(events), nil
@@ -547,12 +640,21 @@ func (b *uringBackend) loop(listener int, a *app, w *writer, stop <-chan os.Sign
 		default:
 		}
 		now := time.Now()
+		// Memory guard: on engagement cancel the live multishot accepts; the
+		// rearm condition below suppresses new accepts until it releases.
+		// Cancelling (rather than accepting and immediately closing) keeps
+		// clients in the kernel backlog so they observe connect timeouts
+		// instead of burning server memory on short-lived slots. len(b.conns)
+		// counts connections still awaiting their close CQE, which only makes
+		// the cap conservative. While shedding, idle connections are closed in
+		// bounded batches.
+		b.applyGuard(now)
 		ringCount := 1
 		if b.direct {
 			ringCount = 2
 		}
 		for i := 0; i < ringCount; i++ {
-			if !b.acceptLive[i] && !b.acceptCancel[i] && b.waitingClose[i] == 0 && b.closePending[i] == 0 && !now.Before(b.acceptRetry[i]) && (!b.direct || b.active[i] < b.ring(i).DirectSlots()) {
+			if !b.acceptLive[i] && !b.acceptCancel[i] && !b.memBlocked && b.waitingClose[i] == 0 && b.closePending[i] == 0 && !now.Before(b.acceptRetry[i]) && (!b.direct || b.active[i] < b.ring(i).DirectSlots()) && (b.guard == nil || !b.guard.reAdmitGated(now)) {
 				b.ring(i).Accept(listener)
 				b.acceptLive[i] = true
 			}

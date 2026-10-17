@@ -1,52 +1,59 @@
-# Builds bin/server from app/.
-#
-# On x86-64 it first checks that this CPU can run x86-64-v3 code (AVX2, BMI2, FMA, ...): a tiny probe
-# program is built with the same flags and run once. If it runs, the server is built with GOAMD64=v3 and
-# -march=x86-64-v3 for the C code (SQLite and the feed helper). If anything about that fails, the build
-# falls back to the baseline flags, so v3 can only ever make the build faster, never break it.
-#
-#   make            build bin/server (v3 if possible)
-#   make baseline   build bin/server without v3
-#   make clean
+# LLVM_BIN and GO may select installed toolchains of the pinned versions.
+# Default: bundled Go PGO + SQLite PGO + ThinLTO; SQLite PGO requires v3.
+# Training is never enabled. Go PGO, SQLite PGO and ThinLTO toggle independently.
+.DEFAULT_GOAL := all
+GO ?= /usr/local/go/bin/go
+LLVM_BIN ?= /opt/llvm-23.1.3/bin
+export GO LLVM_BIN
 
-GO      ?= /usr/local/go/bin/go
-TAGS    := cgo_sqlite
-BIN     := bin/server
-GOARCH  := $(shell $(GO) env GOARCH)
-
-export CGO_ENABLED := 1
-export GOTOOLCHAIN := local
-export GOFLAGS     := -mod=readonly -trimpath
-
-BASE_CFLAGS := -O2
-V3_CFLAGS   := -O2 -march=x86-64-v3
-
-.PHONY: all baseline clean
-
+.PHONY: all baseline pgo nonpgo nolto test test-pgo test-build thinlto test-thinlto go-pgo test-go-pgo no-go-pgo test-no-go-pgo clean
 all:
-	@mkdir -p bin build
-	@if [ "$(GOARCH)" = amd64 ] && $(MAKE) --no-print-directory v3-probe; then \
-		echo "build: CPU runs x86-64-v3, building with GOAMD64=v3"; \
-		if GOAMD64=v3 CGO_CFLAGS="$(V3_CFLAGS)" $(GO) build -C app -tags $(TAGS) -o ../$(BIN) . ; then \
-			exit 0; \
-		fi; \
-		echo "build: v3 build failed, falling back to baseline"; \
-	else \
-		echo "build: x86-64-v3 not available here, building baseline"; \
-	fi; \
-	$(MAKE) --no-print-directory baseline
+	./build.sh
 
+# Explicit v1 without either Go or SQLite PGO; ThinLTO remains enabled.
 baseline:
-	@mkdir -p bin
-	GOAMD64=v1 CGO_CFLAGS="$(BASE_CFLAGS)" $(GO) build -C app -tags $(TAGS) -o ../$(BIN) .
+	./build.sh --baseline
 
-# Succeeds only if a program built with the v3 flags (Go and C) actually runs on this CPU and the CPU
-# reports x86-64-v3 support. The Go runtime refuses to start a GOAMD64=v3 binary on an older CPU.
-.PHONY: v3-probe
-v3-probe:
-	@mkdir -p build
-	@GOAMD64=v3 CGO_CFLAGS="$(V3_CFLAGS)" $(GO) build -C v3probe -o ../build/v3probe . >/dev/null 2>&1 \
-		&& ./build/v3probe >/dev/null 2>&1
+pgo:
+	./build.sh --pgo
+
+# Disable only SQLite PGO with CPU-probed v3/v1; keep Go PGO and ThinLTO.
+nonpgo:
+	./build.sh --no-pgo
+
+# Go and SQLite PGO without ThinLTO; SQLite PGO still requires v3.
+nolto:
+	./build.sh --no-thinlto
+
+test:
+	./build.sh --test
+
+test-pgo:
+	./build.sh --pgo --test
+
+thinlto:
+	./build.sh --pgo --thinlto
+
+test-thinlto:
+	./build.sh --pgo --thinlto --test
+
+# Explicit bundled Go PGO; equivalent to the default optimization settings.
+go-pgo:
+	./build.sh --go-pgo profiles/go.pprof --go-pgo-sha256 cffbedaaa8f7208e6cce79844a858e8ae2f08a3a14079cdc345f0968e63eb6ff
+
+test-go-pgo:
+	./build.sh --test --go-pgo profiles/go.pprof --go-pgo-sha256 cffbedaaa8f7208e6cce79844a858e8ae2f08a3a14079cdc345f0968e63eb6ff
+
+# Disable only Go PGO; retain SQLite PGO + ThinLTO.
+no-go-pgo:
+	./build.sh --no-go-pgo
+
+test-no-go-pgo:
+	./build.sh --no-go-pgo --test
+
+# No LLVM, network, or Linux compilation; real profile checks use local Go if present.
+test-build:
+	python3 -m unittest discover -s tests -p test_build.py -v
 
 clean:
 	rm -rf bin build

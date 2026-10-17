@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-// Adapted from tbsvttr's Go net/http submission (PR #18) to
-// arjaythedev/twelve-dollar-server-challenge, licensed under the repository MIT
-// license. Original parsing, HTTP, JSON and SQL design are retained here.
-// This experiment calls the same API/SQL directly from a Linux epoll loop.
-// Validated writes are handed to a dedicated group-commit writer.
+// Portions of the request validation, JWT authentication and write handling
+// derive from tbsvttr's MIT-licensed Go net/http submission:
+// https://github.com/arjaythedev/twelve-dollar-server-challenge/pull/18
+// The API contract is defined by the challenge specification. This submission
+// uses its own HTTP transport with io_uring and epoll backends, a C SQLite read
+// path, and a dedicated group-commit writer; see README.md for the architecture.
 package main
 
 import (
@@ -72,17 +73,29 @@ func (a *app) authenticate(auth string) (int64, string, string) {
 		return 0, "", "missing bearer token"
 	}
 	invalid := "invalid or expired token"
-	token := strings.TrimPrefix(auth, "Bearer ")
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
+	token := auth[len("Bearer "):]
+	firstDot := strings.IndexByte(token, '.')
+	if firstDot < 0 {
 		return 0, "", invalid
 	}
-	decoded := make([][]byte, 3)
+	secondDot := strings.IndexByte(token[firstDot+1:], '.')
+	if secondDot < 0 {
+		return 0, "", invalid
+	}
+	secondDot += firstDot + 1
+	parts := [3]string{token[:firstDot], token[firstDot+1 : secondDot], token[secondDot+1:]}
+	var decoded [2][]byte
 	for i, part := range parts {
-		for _, c := range part {
+		// Decode accepts CR/LF, so keep the explicit URL-safe alphabet check.
+		// It also rejects any extra dot after the first two separators.
+		for j := 0; j < len(part); j++ {
+			c := part[j]
 			if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
 				return 0, "", invalid
 			}
+		}
+		if i == 2 {
+			continue
 		}
 		var err error
 		decoded[i], err = base64.RawURLEncoding.DecodeString(part)
@@ -90,9 +103,19 @@ func (a *app) authenticate(auth string) (int64, string, string) {
 			return 0, "", invalid
 		}
 	}
+	// Keep the signature separate from the JSON buffers so it stays on the
+	// stack. Reject oversized encodings before Decode writes to the buffer.
+	var signature [sha256.Size]byte
+	if len(parts[2]) != base64.RawURLEncoding.EncodedLen(len(signature)) {
+		return 0, "", invalid
+	}
+	n, err := base64.RawURLEncoding.Decode(signature[:], []byte(parts[2]))
+	if err != nil || n != len(signature) {
+		return 0, "", invalid
+	}
 	mac := hmac.New(sha256.New, a.secret)
-	mac.Write([]byte(parts[0] + "." + parts[1]))
-	if !hmac.Equal(mac.Sum(nil), decoded[2]) {
+	mac.Write([]byte(token[:secondDot]))
+	if !hmac.Equal(mac.Sum(nil), signature[:]) {
 		return 0, "", invalid
 	}
 	var head, claims map[string]any

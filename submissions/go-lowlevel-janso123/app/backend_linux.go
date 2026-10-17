@@ -25,7 +25,7 @@ func directTableSize() (int, error) {
 	return int(limit.Cur), nil
 }
 
-func loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error) error {
+func loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error, g *memGuard) error {
 	mode := env("NETWORK_BACKEND", "auto")
 	var fallback error
 	switch mode {
@@ -36,7 +36,7 @@ func loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() 
 			b, openErr := newDirectBackend(slots)
 			if openErr == nil {
 				fmt.Fprintf(os.Stderr, "network_backend=uring-direct requested=%s\n", mode)
-				return b.loop(listener, a, w, stop, onStop)
+				return b.loop(listener, a, w, stop, onStop, g)
 			}
 			e = openErr
 		}
@@ -44,14 +44,14 @@ func loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() 
 		b, normalErr := newUringBackend()
 		if normalErr == nil {
 			fmt.Fprintf(os.Stderr, "network_backend=uring requested=%s fallback_reason=%q\n", mode, fallback)
-			return b.loop(listener, a, w, stop, onStop)
+			return b.loop(listener, a, w, stop, onStop, g)
 		}
 		fallback = fmt.Errorf("%v; uring: %w", fallback, normalErr)
 	case "uring":
 		b, e := newUringBackend()
 		if e == nil {
 			fmt.Fprintf(os.Stderr, "network_backend=uring requested=%s\n", mode)
-			return b.loop(listener, a, w, stop, onStop)
+			return b.loop(listener, a, w, stop, onStop, g)
 		}
 		fallback = fmt.Errorf("uring: %w", e)
 	default:
@@ -62,5 +62,5 @@ func loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() 
 	} else {
 		fmt.Fprintf(os.Stderr, "network_backend=epoll requested=%s fallback_reason=%q\n", mode, fallback)
 	}
-	return epollLoop(listener, a, w, stop, onStop)
+	return epollLoop(listener, a, w, stop, onStop, g)
 }

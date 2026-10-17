@@ -15,6 +15,7 @@ const maxInput = 65536 // also caps chunk framing and trailers
 type request struct {
 	job                    job
 	close, proto10, expect bool
+	bodyPooled             bool
 }
 type parseError struct {
 	status int
@@ -40,7 +41,13 @@ func hasToken(s, want string) bool {
 	}
 	return false
 }
-func parseRequest(b []byte) (r request, consumed int, e *parseError) {
+func parseRequest(b []byte) (request, int, *parseError)      { return parseRequestMode(b, nil, true) }
+func parseRequestCheck(b []byte) (request, int, *parseError) { return parseRequestMode(b, nil, false) }
+func parseRequestPooled(b []byte, p *bufferPool) (request, int, *parseError) {
+	return parseRequestMode(b, p, true)
+}
+
+func parseRequestMode(b []byte, p *bufferPool, decodeBody bool) (r request, consumed int, e *parseError) {
 	bad := func(status int) (request, int, *parseError) { return r, 0, &parseError{status: status} }
 	end := bytes.Index(b, []byte("\r\n\r\n"))
 	if end < 0 {
@@ -134,7 +141,7 @@ func parseRequest(b []byte) (r request, consumed int, e *parseError) {
 		if !strings.EqualFold(te, "chunked") || r.proto10 {
 			return bad(501)
 		}
-		body, n, status := chunkBody(b[start:])
+		body, n, status := chunkBody(b[start:], p, decodeBody)
 		if status != 0 {
 			return bad(status)
 		}
@@ -142,6 +149,7 @@ func parseRequest(b []byte) (r request, consumed int, e *parseError) {
 			return
 		}
 		r.job.body = body
+		r.bodyPooled = decodeBody && p != nil
 		return r, start + n, nil
 	}
 	if length < 0 {
@@ -158,10 +166,11 @@ func parseRequest(b []byte) (r request, consumed int, e *parseError) {
 	return r, start + length, nil
 }
 
-func chunkBody(b []byte) ([]byte, int, int) {
+func chunkBody(b []byte, p *bufferPool, decode bool) ([]byte, int, int) {
 	pos, total := 0, 0
 	type span struct{ start, end int }
-	var spans []span
+	var stack [32]span
+	spans := stack[:0]
 	for {
 		if len(b) > maxInput {
 			return nil, 0, 413
@@ -206,9 +215,16 @@ func chunkBody(b []byte) ([]byte, int, int) {
 				}
 				pos = end + 2
 			}
-			body := make([]byte, 0, total)
-			for _, s := range spans {
-				body = append(body, b[s.start:s.end]...)
+			var body []byte
+			if decode {
+				if p == nil {
+					body = make([]byte, 0, total)
+				} else {
+					body = p.take()
+				}
+				for _, s := range spans {
+					body = append(body, b[s.start:s.end]...)
+				}
 			}
 			return body, pos, 0
 		}
@@ -222,7 +238,9 @@ func chunkBody(b []byte) ([]byte, int, int) {
 		if b[next] != '\r' || b[next+1] != '\n' {
 			return nil, 0, 400
 		}
-		spans = append(spans, span{pos, next})
+		if decode {
+			spans = append(spans, span{pos, next})
+		}
 		total += int(n)
 		pos = next + 2
 	}

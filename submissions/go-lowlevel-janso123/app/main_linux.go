@@ -66,7 +66,7 @@ func listenSocket(host, port string) (int, error) {
 	}
 	return fd, nil
 }
-func epollLoop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error) error {
+func epollLoop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error, g *memGuard) error {
 	ep, e := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if e != nil {
 		return e
@@ -111,7 +111,7 @@ func epollLoop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop fu
 		} else if c.draining {
 			events = unix.EPOLLIN | unix.EPOLLRDHUP
 		} else if c.output != nil || len(c.input) > 0 { // writable scheduling also resumes a bounded pipeline
-			_, n, e := parseRequest(c.input)
+			_, n, e := parseRequestCheck(c.input)
 			if c.output != nil || n > 0 || e != nil {
 				events |= unix.EPOLLOUT
 			} else {
@@ -124,11 +124,63 @@ func epollLoop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop fu
 	}
 	events := make([]unix.EpollEvent, 1024)
 	sweep := time.Now().Add(time.Second)
+	// memBlocked is the memory/hard-cap/stale gate (owning the pool and idle
+	// release); listenerGated additionally masks the listener for the duration
+	// of the gradual re-admission budget, so the accept path cannot spin while
+	// re-admission tokens refill.
+	memBlocked := false
+	listenerGated := false
+	// applyGuard evaluates the memory guard and applies the accept gate. It runs
+	// at least once per loop iteration — before the wait and again after each
+	// event batch — so a watermark or cap crossed mid-batch takes effect in the
+	// same iteration. On engage the process pool is dropped and idle
+	// connections release their input buffers (reallocated lazily); while
+	// shedding it also closes idle connections in bounded batches.
+	applyGuard := func() error {
+		now := time.Now()
+		blocked := g.update(len(connections), now)
+		if blocked != memBlocked {
+			memBlocked = blocked
+			pool.setBlocked(blocked)
+			if blocked {
+				for _, c := range connections {
+					c.releaseIdle(&pool)
+				}
+			}
+		}
+		gate := blocked || g.reAdmitGated(now)
+		if gate != listenerGated {
+			listenerGated = gate
+			interest := uint32(unix.EPOLLIN)
+			if gate {
+				interest = 0
+			}
+			if e := unix.EpollCtl(ep, unix.EPOLL_CTL_MOD, listener, &unix.EpollEvent{Events: interest, Fd: int32(listener)}); e != nil {
+				return e
+			}
+		}
+		// Emergency shedding: close idle keep-alive connections in bounded
+		// batches. Active connections (response in flight or writer job queued)
+		// are never touched here; they are closed on their own event once the
+		// in-flight response has been fully sent (see the per-connection path).
+		if g.shedSweepDue(now) {
+			shedSweepIdle(connections, memGuardShedBatch, closeConn, func() { g.noteShedClose(true) })
+		}
+		return nil
+	}
 	for {
 		select {
 		case <-stop:
 			return onStop()
 		default:
+		}
+		// Memory guard: drop or restore EPOLLIN interest on the listener. With
+		// interest removed the kernel stops delivering accept readiness and new
+		// clients wait in the SYN/accept backlog (bounded, tiny per-connection
+		// cost) instead of allocating server memory; clients see connect
+		// timeouts rather than resets. Established connections are unaffected.
+		if e = applyGuard(); e != nil {
+			return e
 		}
 		// Real syscall releases the P; 100ms cap also bounds signal delivery latency.
 		n, e := unix.EpollWait(ep, events, 100)
@@ -173,7 +225,20 @@ func epollLoop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop fu
 				continue
 			}
 			if int(ev.Fd) == listener {
+				if listenerGated {
+					// A readiness event queued before the interest change.
+					continue
+				}
 				for accepted := 0; accepted < 128; accepted++ {
+					// Re-evaluate the guard before every accept against the
+					// newest published sample (one atomic load), not just the
+					// precomputed gate, so a watermark crossed by this very
+					// batch stops it. admit additionally charges the gradual
+					// re-admission token bucket; when it is empty the batch
+					// stops for this tick and the listener is masked.
+					if g.acceptBlocked(len(connections), now) || !g.admit(now) {
+						break
+					}
 					fd, _, e := unix.Accept4(listener, unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
 					if e == unix.EAGAIN || e == unix.EWOULDBLOCK {
 						break
@@ -233,9 +298,23 @@ func epollLoop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop fu
 				closeConn(c)
 				continue
 			}
+			// Emergency shedding: a connection whose in-flight response has
+			// now been fully sent (no pending writer job, no buffered output,
+			// no partial request) is closed instead of being re-armed for recv.
+			if g.shedding() && c.shedIdle() {
+				g.noteShedClose(false)
+				closeConn(c)
+				continue
+			}
 			if err = update(c); err != nil {
 				closeConn(c)
 			}
+		}
+		// Re-evaluate after the batch: an accept batch or a wave of closes may
+		// have moved the open count across the cap, or the sampler may have
+		// crossed a watermark; apply the gate before the next blocking wait.
+		if e = applyGuard(); e != nil {
+			return e
 		}
 		now = time.Now()
 		if !now.Before(sweep) {
@@ -264,6 +343,20 @@ func run() (err error) {
 	if e != nil || capacity < 1 || capacity > 65536 {
 		return errors.New("WRITE_QUEUE_CAPACITY must be between 1 and 65536")
 	}
+	// Registered before any SQLite owner starts: later defers close the loop,
+	// drain/join the writer and join its checkpointer before the training dump.
+	// The default and profile-use builds compile this call to a no-op.
+	if e := startSQLiteProfile(); e != nil {
+		return e
+	}
+	defer func() {
+		if e := dumpSQLiteProfile(); e != nil {
+			err = errors.Join(err, e)
+		}
+	}()
+	if e := configureSQLiteMemoryStatus(); e != nil {
+		return e
+	}
 	stats := &writerMetrics{}
 	w, e := startWriter(path, []byte(secret), capacity, os.Stderr, stats)
 	if e != nil {
@@ -275,15 +368,32 @@ func run() (err error) {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stop)
+	profiles, e := startProfiles(os.Getenv("CPU_PROFILE"), os.Getenv("HEAP_PROFILE"), os.Stderr)
+	if e != nil {
+		return e
+	}
+	defer func() {
+		if e := profiles.Close(); e != nil && !errors.Is(err, e) {
+			err = errors.Join(err, e)
+		}
+	}()
 	fd, e := listenSocket(env("HOST", "127.0.0.1"), env("PORT", "3000"))
 	if e != nil {
 		return e
 	}
 	defer unix.Close(fd)
+	g, e := startMemGuard(os.Stderr)
+	if e != nil {
+		return e
+	}
+	defer g.stop()
 	err = loop(fd, a, w, stop, func() error {
+		// Snapshot the serving heap before writer and loop resources are released.
+		// A profile error must not skip the existing writer drain.
+		e := profiles.Close()
 		w.shutdown()
-		return nil
-	})
+		return e
+	}, g)
 	return err
 }
 func main() {

@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-func loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error) error {
+func loop(listener int, a *app, w *writer, stop <-chan os.Signal, onStop func() error, g *memGuard) error {
 	fmt.Fprintln(os.Stderr, "network_backend=epoll fallback_reason=unsupported_architecture")
-	return epollLoop(listener, a, w, stop, onStop)
+	return epollLoop(listener, a, w, stop, onStop, g)
 }

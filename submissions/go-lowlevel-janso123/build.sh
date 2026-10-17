@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the server as a normal user (downloads the pinned Go modules from go.sum). See Makefile.
+# Pinned local toolchains; SQLite PGO and ThinLTO default on, with opt-out flags.
 set -euo pipefail
 cd "$(dirname "$0")"
-make
+exec python3 ./build.py "$@"

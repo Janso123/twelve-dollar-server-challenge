@@ -14,6 +14,7 @@ import (
 
 type Stats struct {
 	Enters, OverflowFlushes, BufferExhaustions uint64
+	SendArenaHits, SendFallbackMmaps           uint64
 	FixedBytes, SendMappedBytes                int
 }
 type Ring struct {
@@ -28,8 +29,8 @@ type Ring struct {
 	owned                                   []bool
 	available                               int
 	bufTail                                 uint16
-	sends                                   map[uint64][]byte
-	sendFree                                [][]byte
+	sends                                   map[uint64]sendSlot
+	sendArena                               *sendArena
 	stats                                   Stats
 }
 
@@ -58,7 +59,7 @@ func Open(entries, buffers int) (r *Ring, err error) {
 	if entries < 8 || entries > 32768 || entries&(entries-1) != 0 || buffers < 2 || buffers > 32768 || buffers&(buffers-1) != 0 {
 		return nil, errors.New("ring/buffer counts must be powers of two")
 	}
-	r = &Ring{fd: -1, sends: make(map[uint64][]byte), owned: make([]bool, buffers), available: buffers}
+	r = &Ring{fd: -1, sends: make(map[uint64]sendSlot), owned: make([]bool, buffers), available: buffers}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, r.Close())
@@ -133,10 +134,13 @@ func Open(entries, buffers int) (r *Ring, err error) {
 	if r.buffers, err = anon(buffers * bufferSize); err != nil {
 		return
 	}
+	if r.sendArena, err = newSendArena(sendArenaCounts); err != nil {
+		return
+	}
 	for i := 0; i < buffers; i++ {
 		r.provide(uint16(i))
 	}
-	for _, b := range [][]byte{r.control, r.sq, r.sqes, r.bufRing, r.buffers} {
+	for _, b := range [][]byte{r.control, r.sq, r.sqes, r.bufRing, r.buffers, r.sendArena.mapping} {
 		page := unix.Getpagesize()
 		r.stats.FixedBytes += (len(b) + page - 1) / page * page
 	}
@@ -227,42 +231,43 @@ func (r *Ring) Send(fd int, b []byte, tag uint64) (int, error) {
 	for size < len(b) {
 		size *= 2
 	}
-	var slab []byte
-	for i, s := range r.sendFree {
-		if len(s) >= size {
-			slab = s
-			r.sendFree = append(r.sendFree[:i], r.sendFree[i+1:]...)
-			break
-		}
+	var slot sendSlot
+	var arenaHit bool
+	if r.sendArena != nil {
+		slot, arenaHit = r.sendArena.acquire(len(b))
 	}
-	if slab == nil {
+	if !arenaHit {
 		var e error
-		slab, e = anon(size)
+		slot.buf, e = anon(size)
 		if e != nil {
 			return 0, e
 		}
-		r.stats.SendMappedBytes += len(slab)
+		slot.class = -1
+		r.stats.SendFallbackMmaps++
+		r.stats.SendMappedBytes += len(slot.buf)
+	} else {
+		r.stats.SendArenaHits++
 	}
-	copy(slab, b)
-	r.sends[tag] = slab
+	copy(slot.buf, b)
+	r.sends[tag] = slot
 	flags := uint8(0)
 	if r.direct {
 		flags = fixedFileFlag
 	}
-	r.pending = append(r.pending, sqe{Opcode: opSend, Flags: flags, FD: int32(fd), Addr: addr(slab), Len: uint32(len(b)), OpFlags: unix.MSG_NOSIGNAL, Tag: tag})
+	r.pending = append(r.pending, sqe{Opcode: opSend, Flags: flags, FD: int32(fd), Addr: addr(slot.buf), Len: uint32(len(b)), OpFlags: unix.MSG_NOSIGNAL, Tag: tag})
 	return len(b), nil
 }
 func (r *Ring) FinishSend(tag uint64) {
-	b, ok := r.sends[tag]
+	slot, ok := r.sends[tag]
 	if !ok {
 		panic("unknown send completion")
 	}
 	delete(r.sends, tag)
-	if len(b) <= 65536 && len(r.sendFree) < 64 {
-		r.sendFree = append(r.sendFree, b)
+	if slot.class >= 0 {
+		r.sendArena.release(slot)
 	} else {
-		unix.Munmap(b)
-		r.stats.SendMappedBytes -= len(b)
+		unix.Munmap(slot.buf)
+		r.stats.SendMappedBytes -= len(slot.buf)
 	}
 }
 func (r *Ring) Bytes(c Completion) []byte {
@@ -406,15 +411,15 @@ func (r *Ring) Close() error {
 		unix.Close(r.fd)
 		r.fd = -1
 	}
-	for _, b := range r.sends {
-		unix.Munmap(b)
-	}
-	for _, b := range r.sendFree {
-		unix.Munmap(b)
+	var err error
+	for _, s := range r.sends {
+		if s.class < 0 {
+			err = errors.Join(err, unix.Munmap(s.buf))
+		}
 	}
 	r.sends = nil
-	r.sendFree = nil
-	var err error
+	err = errors.Join(err, r.sendArena.close())
+	r.sendArena = nil
 	for _, b := range [][]byte{r.buffers, r.bufRing, r.sqes, r.sq, r.control} {
 		if b != nil {
 			err = errors.Join(err, unix.Munmap(b))

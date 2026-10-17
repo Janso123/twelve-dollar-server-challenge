@@ -3,8 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { SQL_OK=0, SQL_INTEGER=1, SQL_NULL=5, SQL_ROW=100, SQL_DONE=101,
-       SQL_OPEN_READWRITE=2, PINNED_SQLITE_VERSION=3053004 };
+enum { SQL_OK=0, SQL_ROW=100, SQL_DONE=101, SQL_OPEN_READWRITE=2,
+       SQL_OPEN_NOMUTEX=0x8000, SQLITE_CONFIG_MEMSTATUS=9,
+       PINNED_SQLITE_VERSION=3053004 };
 
 struct cf_reader { sqlite3 *db; sqlite3_stmt *feed; sqlite3_stmt *post; };
 typedef struct { char *data; size_t cap; size_t len; int overflow; } sink;
@@ -17,6 +18,9 @@ static void bytes(sink *s, const char *p, size_t n) {
     s->len += n;
 }
 static void lit(sink *s, const char *p) { bytes(s, p, strlen(p)); }
+static int plain(unsigned char c) {
+    return c>=0x20 && c<0x80 && c!='"' && c!='\\' && c!='<' && c!='>' && c!='&';
+}
 
 /* Match encoding/json's string encoder, including replacement of each invalid
  * UTF-8 byte and HTML/U+2028/U+2029 escaping. SQLite text is length-delimited. */
@@ -25,6 +29,18 @@ static void quote(sink *s, const unsigned char *p, size_t n) {
     bytes(s, "\"", 1);
     for (size_t i=0; i<n;) {
         unsigned char c=p[i];
+        if (plain(c)) {
+            size_t start=i++;
+            while (i<n && plain(p[i])) i++;
+            size_t run=i-start;
+            /* Match the old sink's partial prefix if a run crosses cap. */
+            size_t room=s->len<s->cap ? s->cap-s->len : 0;
+            if (!s->overflow && run>room && room) {
+                bytes(s,(const char *)&p[start],room);
+                bytes(s,(const char *)&p[start+room],run-room);
+            } else bytes(s,(const char *)&p[start],run);
+            continue;
+        }
         if (c<0x80) {
             const char *special=NULL;
             switch (c) {
@@ -72,8 +88,6 @@ static int number(sink *s, int64_t value) {
     bytes(s,buf,(size_t)n); return 1;
 }
 static int post(sink *s, sqlite3_stmt *stmt) {
-    if (sqlite3_column_type(stmt,0)==SQL_NULL || sqlite3_column_type(stmt,4)==SQL_NULL) return 0;
-    for (int i=1;i<=3;i++) if (sqlite3_column_type(stmt,i)==SQL_NULL) return 0;
     lit(s,"{\"id\":"); if (!number(s,sqlite3_column_int64(stmt,0))) return 0;
     for (int i=1;i<=3;i++) {
         lit(s,i==1 ? ",\"body\":" : i==2 ? ",\"created_at\":" : ",\"author\":");
@@ -89,7 +103,7 @@ static int post(sink *s, sqlite3_stmt *stmt) {
 cf_reader *cf_open(const char *path, const char *feed_sql, const char *post_sql) {
     if (sqlite3_libversion_number()!=PINNED_SQLITE_VERSION) return NULL;
     cf_reader *r=calloc(1,sizeof(*r)); if (!r) return NULL;
-    if (sqlite3_open_v2(path,&r->db,SQL_OPEN_READWRITE,NULL)!=SQL_OK) goto fail;
+    if (sqlite3_open_v2(path,&r->db,SQL_OPEN_READWRITE|SQL_OPEN_NOMUTEX,NULL)!=SQL_OK) goto fail;
     const char *pragmas[]={"PRAGMA locking_mode=NORMAL", "PRAGMA journal_mode=WAL",
         "PRAGMA synchronous=NORMAL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=0",
         "PRAGMA cache_size=-8192", "PRAGMA mmap_size=268435456", "PRAGMA query_only=ON"};
@@ -99,6 +113,10 @@ cf_reader *cf_open(const char *path, const char *feed_sql, const char *post_sql)
     if (sqlite3_prepare_v2(r->db,post_sql,-1,&r->post,NULL)!=SQL_OK) goto fail;
     return r;
 fail: cf_close(r); return NULL;
+}
+
+int cf_disable_memstatus(void) {
+    return sqlite3_config(SQLITE_CONFIG_MEMSTATUS,0);
 }
 
 void cf_close(cf_reader *r) {

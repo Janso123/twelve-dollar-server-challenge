@@ -10,8 +10,16 @@ import "C"
 
 import (
 	"errors"
+	"fmt"
 	"unsafe"
 )
+
+func configureSQLiteMemoryStatus() error {
+	if rc := C.cf_disable_memstatus(); rc != 0 {
+		return fmt.Errorf("sqlite3_config MEMSTATUS: code %d", int(rc))
+	}
+	return nil
+}
 
 type cReader struct {
 	ptr *C.cf_reader

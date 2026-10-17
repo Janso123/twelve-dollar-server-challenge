@@ -14,7 +14,7 @@ func openSQLite(path string, diagnostics io.Writer) (*sql.DB, *sql.Conn, error) 
 	if err != nil {
 		return nil, nil, err
 	}
-	dsn := (&url.URL{Scheme: "file", Path: path}).String() + "?mode=rw"
+	dsn := (&url.URL{Scheme: "file", Path: path}).String() + "?mode=rw&_mutex=no"
 	db, err := sql.Open(sqliteDriver, dsn)
 	if err != nil {
 		return nil, nil, err
